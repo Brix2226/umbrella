@@ -1,6 +1,7 @@
 import json
 import os
 import plistlib
+import sys
 import subprocess
 import time
 from pathlib import Path, PureWindowsPath
@@ -56,9 +57,15 @@ if os.environ.get("FAIL_CODESIGN"):
 '''
 
 POWERSHELL = r'''
-import sys
+import json, sys
+conf = json.load(open({conf!r}))
 open({log!r}, "a").write(sys.argv[-1] + "\n")
-print({out!r})
+if conf.get("fail"):
+    sys.exit(1)
+if "Get-AppxPackage" in sys.argv[-1]:
+    print(conf.get("family", ""))
+else:
+    print("ok")
 '''
 
 
@@ -199,69 +206,154 @@ class MacDesktopTest(FakeHomeTest):
 
 
 class WindowsDesktopTest(FakeHomeTest):
+    """Mirrors a real WSL2 setup: Windows folders are NOT on WSL's PATH, and Claude is a Store app."""
+
+    USER = "C:\\Users\\TaeOn"
+    LOCAL = USER + "\\AppData\\Local"
+    STORE_ALIAS = LOCAL + "\\Microsoft\\WindowsApps\\Claude_pzs8sxrjxfjjc\\claude-desktop.exe"
+
     def setUp(self):
         super().setUp()
         self.c = self.tmp / "c"
-        self.local = self.c / "Users/me/AppData/Local"
-        self.values = {"LOCALAPPDATA": r"C:\Users\me\AppData\Local", "APPDATA": r"C:\Users\me\AppData\Roaming"}
+        self.local = self.c / "Users/TaeOn/AppData/Local"
+        self.values = {"USERPROFILE": self.USER, "LOCALAPPDATA": self.LOCAL,
+                       "APPDATA": self.USER + "\\AppData\\Roaming"}
+        self.ps_log = self.tmp / "ps.log"
+        self.ps_conf = self.tmp / "ps.json"
+        self.set_powershell()
         self.pystub("wslpath", WSLPATH.format(root=str(self.c)))
         self.set_cmd(self.values)
-        self.work = profiles.Profile("work", "/home/me/.umbrella/profiles/work")
+        self.work = profiles.Profile("work", "/home/tai/.umbrella/profiles/work")
         self.personal = profiles.Profile("personal")
 
-    def set_cmd(self, values):
-        self.pystub("cmd.exe", CMD.format(values=values))
+    def windows_stub(self, relpath, code):
+        path = self.c / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!{}\n{}\n".format(sys.executable, code))
+        path.chmod(0o755)
+        return path
 
-    def install_app(self, *relpaths):
+    def set_cmd(self, values):
+        self.windows_stub("Windows/System32/cmd.exe", CMD.format(values=values))
+
+    def set_powershell(self, **conf):
+        self.ps_conf.write_text(json.dumps(conf))
+        self.windows_stub("Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+                          POWERSHELL.format(conf=str(self.ps_conf), log=str(self.ps_log)))
+
+    def install(self, *relpaths):
         for rel in relpaths:
             self.write(rel, "exe", base=self.local)
 
-    def test_helpers(self):
-        self.assertEqual(desktop.windows_env("LOCALAPPDATA"), self.values["LOCALAPPDATA"])
-        self.assertIsNone(desktop.windows_env("NOPE"))
-        self.assertEqual(desktop.to_wsl(r"C:\x\y"), str(self.c / "x/y"))
-        self.assertEqual(desktop.to_windows(self.c / "x"), r"C:\x")
-        self.assertIsNone(desktop.to_windows("/elsewhere"))
-        self.assertEqual(str(desktop.win_umbrella_root()), r"C:\Users\me\AppData\Local\Umbrella")
-        self.assertEqual(str(desktop.win_data_dir(self.work)), r"C:\Users\me\AppData\Local\Umbrella\desktop\work")
-        self.assertEqual(str(desktop.win_config_dir(self.work)), r"C:\Users\me\AppData\Local\Umbrella\claude\work")
+    def install_store_app(self):
+        self.install("Microsoft/WindowsApps/claude-desktop.exe",
+                     "Microsoft/WindowsApps/Claude_pzs8sxrjxfjjc/claude-desktop.exe")
 
-    def test_run_failures(self):
-        (self.bin / "cmd.exe").unlink()
+    # --- reaching Windows ------------------------------------------------------------------------
+
+    def test_windows_tools_found_off_path(self):
+        self.assertEqual(desktop.windows_tool("cmd.exe"), str(self.c / "Windows/System32/cmd.exe"))
+        self.assertEqual(desktop.windows_env("LOCALAPPDATA"), self.LOCAL)
+        self.assertIsNone(desktop.windows_env("NOPE"))
+        self.assertEqual(desktop.powershell("'hi'"), "ok")
+
+    def test_windows_tools_on_path_win(self):
+        on_path = self.pystub("cmd.exe", CMD.format(values={"LOCALAPPDATA": "C:\\elsewhere"}))
+        self.assertEqual(desktop.windows_tool("cmd.exe"), str(on_path))
+        self.assertEqual(desktop.windows_env("LOCALAPPDATA"), "C:\\elsewhere")
+
+    def test_windows_unreachable(self):
+        (self.c / "Windows/System32/cmd.exe").unlink()
+        self.assertIsNone(desktop.windows_tool("cmd.exe"))
         self.assertIsNone(desktop.windows_env("LOCALAPPDATA"))
         with self.assertRaises(UmbrellaError) as cm:
             desktop.win_umbrella_root()
-        self.assertIn("interop", cm.exception.hint)
+        self.assertIn("Couldn't reach Windows from WSL", str(cm.exception))
+        self.assertIn("System32", cm.exception.hint)
+        with self.assertRaises(UmbrellaError) as cm:
+            desktop.plan_launch(self.work, "wsl")
+        self.assertIn("%LOCALAPPDATA%", str(cm.exception))
+        (self.bin / "wslpath").unlink()
+        self.assertIsNone(desktop.to_wsl("C:\\x"))
+
+    def test_capture_failures_and_cwd(self):
         with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("x", 1)):
             self.assertIsNone(desktop.to_wsl("C:\\x"))
+        with mock.patch("subprocess.run", side_effect=OSError):
+            self.assertIsNone(desktop.to_wsl("C:\\x"))
         with mock.patch("os.path.isdir", return_value=True), mock.patch("subprocess.run") as run, \
-                mock.patch.object(desktop.shutil, "which", return_value="/bin/wslpath"):
+                mock.patch.object(desktop.shutil, "which", return_value="/usr/bin/wslpath"):
             run.return_value = subprocess.CompletedProcess([], 0, stdout="C:\\x\n")
             self.assertEqual(desktop.to_windows("/c/x"), "C:\\x")
         self.assertEqual(run.call_args[1]["cwd"], "/mnt/c")
+        self.assertEqual(desktop.to_windows(self.c / "x"), "C:\\x")
+        self.assertIsNone(desktop.to_windows("/elsewhere"))
 
-    def test_find_app_prefers_newest_version(self):
+    def test_profile_folders_avoid_appdata(self):
+        self.assertEqual(str(desktop.win_umbrella_root()), self.USER + "\\.umbrella")
+        self.assertEqual(str(desktop.win_data_dir(self.work)), self.USER + "\\.umbrella\\desktop\\work")
+        self.assertEqual(str(desktop.win_config_dir(self.work)), self.USER + "\\.umbrella\\claude\\work")
+
+    # --- finding the app -------------------------------------------------------------------------
+
+    def test_finds_store_app_alias(self):
+        self.install_store_app()
+        self.assertEqual(desktop.windows_app(), self.STORE_ALIAS)
+
+    def test_finds_top_level_store_alias_even_if_unstatable(self):
+        aliases = self.local / "Microsoft/WindowsApps"
+        aliases.mkdir(parents=True)
+        os.symlink(str(self.tmp / "nowhere"), str(aliases / "claude-desktop.exe"))  # like an app alias
+        self.assertEqual(desktop.windows_app(), self.LOCAL + "\\Microsoft\\WindowsApps\\claude-desktop.exe")
+
+    def test_asks_windows_for_store_package(self):
+        self.set_powershell(family="Claude_pzs8sxrjxfjjc")
+        self.assertEqual(desktop.windows_app(), self.STORE_ALIAS)
+        self.assertIn("Get-AppxPackage", self.ps_log.read_text())
+
+    def test_classic_installer_preferred_newest(self):
+        self.install_store_app()
+        self.install("AnthropicClaude/claude.exe", "AnthropicClaude/app-0.9.1/claude.exe",
+                     "AnthropicClaude/app-0.10.0/claude.exe", "AnthropicClaude/app-x/claude.exe")
+        self.assertEqual(desktop.windows_app(), self.LOCAL + "\\AnthropicClaude\\app-0.10.0\\claude.exe")
+
+    def test_other_layouts(self):
+        self.install("Programs/Claude/Claude.exe")
+        self.assertEqual(desktop.windows_app(), self.LOCAL + "\\Programs\\Claude\\Claude.exe")
+
+    def test_not_found(self):
         self.assertIsNone(desktop.windows_app())
-        self.install_app("AnthropicClaude/claude.exe")
-        self.assertEqual(desktop.windows_app(), self.local / "AnthropicClaude/claude.exe")
-        self.install_app("AnthropicClaude/app-0.9.1/claude.exe", "AnthropicClaude/app-0.10.0/claude.exe",
-                         "AnthropicClaude/app-x/claude.exe")
-        self.assertEqual(desktop.windows_app(), self.local / "AnthropicClaude/app-0.10.0/claude.exe")
-
-    def test_find_app_other_layouts_and_override(self):
-        self.install_app("Microsoft/WindowsApps/Claude.exe")
-        self.assertEqual(desktop.windows_app(), self.local / "Microsoft/WindowsApps/Claude.exe")
-        exe = self.write("claude.exe", "x", base=self.tmp)
-        self.assertEqual(desktop.windows_app({"UMBRELLA_DESKTOP_APP": str(exe)}), exe)
-        self.assertIsNone(desktop.windows_app({"UMBRELLA_DESKTOP_APP": str(self.tmp / "none.exe")}))
+        with self.assertRaises(UmbrellaError) as cm:
+            desktop.plan_launch(self.work, "wsl")
+        self.assertIn("claude-desktop.exe", cm.exception.hint)
         self.set_cmd({"LOCALAPPDATA": "D:\\unmapped"})
         self.assertIsNone(desktop.windows_app())
         self.set_cmd({})
         self.assertIsNone(desktop.windows_app())
 
+    def test_override(self):
+        self.assertEqual(desktop.windows_app({"UMBRELLA_DESKTOP_APP": "D:\\Apps\\claude.exe"}), "D:\\Apps\\claude.exe")
+        exe = self.write("Tools/claude.exe", "x", base=self.c)
+        self.assertEqual(desktop.windows_app({"UMBRELLA_DESKTOP_APP": str(exe)}), "C:\\Tools\\claude.exe")
+        self.assertIsNone(desktop.windows_app({"UMBRELLA_DESKTOP_APP": str(self.c / "none.exe")}))
+
+    # --- launching -------------------------------------------------------------------------------
+
+    def test_command_uses_start_process(self):
+        cmd = desktop.windows_command(self.work, self.STORE_ALIAS)
+        self.assertEqual(cmd[0], str(self.c / "Windows/System32/WindowsPowerShell/v1.0/powershell.exe"))
+        self.assertEqual(cmd[-1], "Start-Process -FilePath '{}' -ArgumentList '\"--user-data-dir={}\"'".format(
+            self.STORE_ALIAS, self.USER + "\\.umbrella\\desktop\\work"))
+        self.assertEqual(desktop.windows_command(self.personal, "C:\\it's.exe")[-1],
+                         "Start-Process -FilePath 'C:\\it''s.exe'")
+        (self.c / "Windows/System32/WindowsPowerShell/v1.0/powershell.exe").unlink()
+        with self.assertRaises(UmbrellaError) as cm:
+            desktop.windows_command(self.work, self.STORE_ALIAS)
+        self.assertIn("powershell.exe", str(cm.exception))
+
     def test_environment(self):
         env = desktop.windows_environment(self.work, {"WSLENV": "FOO/p:CLAUDE_CONFIG_DIR/p", "CLAUDE_CONFIG_DIR": "/x"})
-        self.assertEqual(env["CLAUDE_CONFIG_DIR"], r"C:\Users\me\AppData\Local\Umbrella\claude\work")
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.USER + "\\.umbrella\\claude\\work")
         self.assertEqual(env["WSLENV"], "FOO/p:CLAUDE_CONFIG_DIR:UMBRELLA_PROFILE")
         env = desktop.windows_environment(self.personal, {"CLAUDE_CONFIG_DIR": "/x"})
         self.assertNotIn("CLAUDE_CONFIG_DIR", env)
@@ -269,78 +361,75 @@ class WindowsDesktopTest(FakeHomeTest):
         self.assertIn("HOME", desktop.windows_environment(self.personal))
 
     def test_plan_launch(self):
-        self.install_app("AnthropicClaude/claude.exe")
-        exe = str(self.local / "AnthropicClaude/claude.exe")
+        self.install_store_app()
         launch = desktop.plan_launch(self.work, "wsl")
-        self.assertEqual(launch.command, [exe, r"--user-data-dir=C:\Users\me\AppData\Local\Umbrella\desktop\work"])
+        self.assertIn(self.STORE_ALIAS, launch.command[-1])
+        self.assertEqual(str(launch.data_dir), self.USER + "\\.umbrella\\desktop\\work")
         self.assertTrue(launch.first_run)
-        (self.local / "Umbrella/desktop/work").mkdir(parents=True)
+        (self.c / "Users/TaeOn/.umbrella/desktop/work").mkdir(parents=True)
         self.assertFalse(desktop.plan_launch(self.work, "wsl").first_run)
         launch = desktop.plan_launch(self.personal, "wsl")
-        self.assertEqual(launch.command, [exe])
+        self.assertNotIn("ArgumentList", launch.command[-1])
         self.assertIsNone(launch.data_dir)
-        with self.assertRaises(UmbrellaError) as cm:
-            desktop.plan_launch(self.work, "wsl", {"UMBRELLA_DESKTOP_APP": "/none"})
-        self.assertIn("Windows", str(cm.exception))
 
     def test_start_uses_windows_cwd(self):
-        self.install_app("AnthropicClaude/claude.exe")
+        self.install_store_app()
         launch = desktop.plan_launch(self.work, "wsl")
         with mock.patch("os.path.isdir", return_value=True), mock.patch("subprocess.Popen") as popen:
             desktop.start(launch)
         self.assertEqual(popen.call_args[1]["cwd"], "/mnt/c")
+        self.assertEqual(popen.call_args[1]["env"]["WSLENV"], "CLAUDE_CONFIG_DIR:UMBRELLA_PROFILE")
+
+    # --- Start Menu shortcut ---------------------------------------------------------------------
 
     def test_shortcut(self):
-        log = self.tmp / "ps.log"
-        self.pystub("powershell.exe", POWERSHELL.format(log=str(log), out="ok"))
-        self.install_app("AnthropicClaude/claude.exe")
+        self.install_store_app()
         link = desktop.create_shortcut(self.work, "wsl")
-        self.assertEqual(str(link), r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Claude (work).lnk")
-        vbs = (self.local / "Umbrella/launchers/claude-work.vbs").read_text()
-        self.assertIn('env("CLAUDE_CONFIG_DIR") = "C:\\Users\\me\\AppData\\Local\\Umbrella\\claude\\work"', vbs)
-        self.assertIn('shell.Run """C:\\Users\\me\\AppData\\Local\\AnthropicClaude\\claude.exe"" '
-                      '""--user-data-dir=C:\\Users\\me\\AppData\\Local\\Umbrella\\desktop\\work""", 1, False', vbs)
-        self.assertIn(b"\r\n", (self.local / "Umbrella/launchers/claude-work.vbs").read_bytes())
-        ps = log.read_text()
-        self.assertIn("CreateShortcut('C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\"
-                      "Claude (work).lnk')", ps)
+        self.assertEqual(str(link), self.USER + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\"
+                                                "Claude (work).lnk")
+        vbs_file = self.c / "Users/TaeOn/.umbrella/launchers/claude-work.vbs"
+        vbs = vbs_file.read_text()
+        self.assertIn('env("CLAUDE_CONFIG_DIR") = "{}"'.format(self.USER + "\\.umbrella\\claude\\work"), vbs)
+        self.assertIn('shell.Run """{}"" ""--user-data-dir={}""", 1, False'.format(
+            self.STORE_ALIAS, self.USER + "\\.umbrella\\desktop\\work"), vbs)
+        self.assertIn(b"\r\n", vbs_file.read_bytes())
+        ps = self.ps_log.read_text()
+        self.assertIn("CreateShortcut('{}')".format(link), ps)
         self.assertIn("$s.TargetPath = 'wscript.exe'", ps)
         self.assertIn("Umbrella profile ''work''", ps)
 
         desktop.create_shortcut(self.personal, "wsl")
-        vbs = (self.local / "Umbrella/launchers/claude-personal.vbs").read_text()
+        vbs = (self.c / "Users/TaeOn/.umbrella/launchers/claude-personal.vbs").read_text()
         self.assertNotIn("CLAUDE_CONFIG_DIR", vbs)
-        self.assertIn('shell.Run """C:\\Users\\me\\AppData\\Local\\AnthropicClaude\\claude.exe""", 1, False', vbs)
+        self.assertIn('shell.Run """{}""", 1, False'.format(self.STORE_ALIAS), vbs)
 
     def test_shortcut_failures(self):
-        self.install_app("AnthropicClaude/claude.exe")
+        self.install_store_app()
+        self.set_powershell(fail=True)
         with self.assertRaises(UmbrellaError) as cm:
-            desktop.create_shortcut(self.work, "wsl")  # no powershell.exe
+            desktop.create_shortcut(self.work, "wsl")
         self.assertIn("umbrella desktop work", cm.exception.hint)
+        self.set_powershell()
         with self.assertRaises(UmbrellaError):
-            desktop.create_shortcut(self.work, "wsl", {"UMBRELLA_DESKTOP_APP": "/none"})
-        exe = self.write("claude.exe", "x", base=self.tmp)  # outside the mapped drive: no Windows path
-        with self.assertRaises(UmbrellaError) as cm:
-            desktop.create_shortcut(self.work, "wsl", {"UMBRELLA_DESKTOP_APP": str(exe)})
-        self.assertIn("Windows path", str(cm.exception))
-        self.values["LOCALAPPDATA"] = "D:\\unmapped"
+            desktop.create_shortcut(self.work, "wsl", {"UMBRELLA_DESKTOP_APP": str(self.c / "none.exe")})
+        self.values["USERPROFILE"] = "D:\\unmapped"
         self.set_cmd(self.values)
-        exe = self.write("claude.exe", "x", base=self.c)
         with self.assertRaises(UmbrellaError) as cm:
-            desktop.create_shortcut(self.work, "wsl", {"UMBRELLA_DESKTOP_APP": str(exe)})
+            desktop.create_shortcut(self.work, "wsl")
         self.assertIn("from WSL", str(cm.exception))
 
     def test_remove_artifacts(self):
-        self.pystub("powershell.exe", POWERSHELL.format(log=str(self.tmp / "ps.log"), out="ok"))
-        self.install_app("AnthropicClaude/claude.exe")
+        self.install_store_app()
         desktop.create_shortcut(self.work, "wsl")
-        (self.local / "Umbrella/desktop/work").mkdir(parents=True)
-        self.write("Microsoft/Windows/Start Menu/Programs/Claude (work).lnk", "lnk", base=self.c / "Users/me/AppData/Roaming")
+        self.write("Microsoft/Windows/Start Menu/Programs/Claude (work).lnk", "lnk",
+                   base=self.c / "Users/TaeOn/AppData/Roaming")
+        for sub in ("desktop/work", "claude/work"):
+            (self.c / "Users/TaeOn/.umbrella" / sub).mkdir(parents=True)
         removed = desktop.remove_artifacts(self.work, "wsl")
-        self.assertEqual(len(removed), 3)
-        self.assertFalse((self.local / "Umbrella/desktop/work").exists())
+        self.assertEqual(len(removed), 4)
+        self.assertFalse((self.c / "Users/TaeOn/.umbrella/desktop/work").exists())
         self.assertEqual(desktop.remove_artifacts(self.work, "wsl"), [])
-        self.set_cmd({"LOCALAPPDATA": self.values["LOCALAPPDATA"]})
+        self.set_cmd({"USERPROFILE": self.USER})  # no %APPDATA%: skip the shortcut
         self.assertEqual(desktop.remove_artifacts(self.work, "wsl"), [])
         self.set_cmd({})
         self.assertEqual(desktop.remove_artifacts(self.work, "wsl"), [])
@@ -415,6 +504,6 @@ class DesktopCliTest(CliTest):
     def test_doctor_reports_desktop(self):
         self.assertIn("Claude Desktop app found", self.run_cli("doctor")[1])
         os.environ["UMBRELLA_DESKTOP_APP"] = "/nope"
-        self.assertIn("Couldn't find the Claude Desktop app", self.run_cli("doctor")[1])
+        self.assertIn("Couldn't find Claude.app", self.run_cli("doctor")[1])
         with mock.patch.object(paths, "detect_platform", return_value="linux"):
             self.assertNotIn("Desktop", self.run_cli("doctor")[1])

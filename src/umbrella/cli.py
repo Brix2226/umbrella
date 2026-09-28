@@ -136,6 +136,7 @@ def cmd_login(ctx, args):
     reg.require_initialized()
     profile = reg.get(args.name)
     s = ctx.style
+    runner.require_claude(ctx.env)  # explain a missing install before promising to open anything
     ctx.say("Opening Claude Code as profile '{}'.".format(profile.name))
     ctx.say("  Type /login and sign in with the account you want for this profile, then /exit.")
     code = runner.run_claude(profile, [], ctx.env)
@@ -397,10 +398,11 @@ def cmd_doctor(ctx, args):
                    None if v >= (3, 8) else "Umbrella needs Python 3.8 or newer."))
     platform = paths.detect_platform()
     checks.append(("ok", "Platform: {}".format(paths.platform_name(platform)), None))
-    claude = runner.find_claude(ctx.env)
-    checks.append(("ok", "Claude Code found at {}".format(paths.pretty(claude)), None) if claude else
-                  ("fail", "Claude Code ('claude') isn't on your PATH",
-                   "Install it from https://docs.claude.com/claude-code"))
+    try:
+        claude = runner.require_claude(ctx.env, platform)
+        checks.append(("ok", "Claude Code found at {}".format(paths.pretty(claude)), None))
+    except UmbrellaError as exc:
+        checks.append(("fail", str(exc), exc.hint))
     if platform in ("macos", "wsl"):
         try:
             desktop.plan_launch(profiles.Profile("_"), platform, ctx.env)

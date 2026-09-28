@@ -133,10 +133,16 @@ def write_mac_launcher(profile, app):
 
 # ----- Windows via WSL --------------------------------------------------------------------------
 
-def _run(args):
-    """Run a Windows-interop helper and return its stripped stdout, or None if it failed."""
-    if shutil.which(args[0]) is None:
-        return None
+# Where Windows keeps these, for WSL setups that don't put Windows folders on PATH.
+WINDOWS_TOOLS = {
+    "cmd.exe": r"C:\Windows\System32\cmd.exe",
+    "powershell.exe": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+}
+STORE_ALIAS = "claude-desktop.exe"
+
+
+def _capture(args):
+    """Run a program and return its stripped stdout, or None if it failed or printed nothing."""
     cwd = "/mnt/c" if os.path.isdir("/mnt/c") else None
     try:
         result = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -147,30 +153,64 @@ def _run(args):
     return out if result.returncode == 0 and out else None
 
 
-def windows_env(name):
-    value = _run(["cmd.exe", "/d", "/c", "echo %{}%".format(name)])
-    return None if value is None or value == "%{}%".format(name) else value
+def _wslpath(flag, value):
+    if shutil.which("wslpath") is None:
+        return None
+    return _capture(["wslpath", flag, str(value)])
 
 
 def to_wsl(win_path):
-    return _run(["wslpath", "-u", str(win_path)])
+    return _wslpath("-u", win_path)
 
 
 def to_windows(wsl_path):
-    return _run(["wslpath", "-w", str(wsl_path)])
+    return _wslpath("-w", wsl_path)
+
+
+def windows_tool(name):
+    """WSL path to a Windows program, found on PATH or at its standard location."""
+    found = shutil.which(name)
+    if found:
+        return found
+    local = to_wsl(WINDOWS_TOOLS[name])
+    return local if local and os.path.isfile(local) else None
+
+
+def _run_windows(name, args):
+    tool = windows_tool(name)
+    return None if tool is None else _capture([tool] + list(args))
+
+
+def windows_env(name):
+    value = _run_windows("cmd.exe", ["/d", "/c", "echo %{}%".format(name)])
+    return None if value is None or value == "%{}%".format(name) else value
+
+
+def powershell(script):
+    return _run_windows("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script])
+
+
+def _interop_error(what):
+    return UmbrellaError(
+        "Couldn't reach Windows from WSL ({}).".format(what),
+        hint="Umbrella looks for cmd.exe and powershell.exe on your PATH and under C:\\Windows\\System32. "
+             "Check that running '/mnt/c/Windows/System32/cmd.exe /c ver' works in this shell.")
 
 
 def _require_windows_env(name):
     value = windows_env(name)
     if value is None:
-        raise UmbrellaError("Couldn't ask Windows for %{}%.".format(name),
-                            hint="Make sure WSL interop is on: running 'cmd.exe /c ver' should work from this shell.")
+        raise _interop_error("asking for %{}%".format(name))
     return value
 
 
 def win_umbrella_root():
-    """Umbrella's folder on the Windows side, as a Windows path."""
-    return PureWindowsPath(_require_windows_env("LOCALAPPDATA")) / "Umbrella"
+    """Umbrella's folder on the Windows side, as a Windows path.
+
+    It's deliberately not under AppData: Windows redirects what Microsoft Store apps write inside
+    AppData to a private folder, which would hide the profile's data from Umbrella.
+    """
+    return PureWindowsPath(_require_windows_env("USERPROFILE")) / ".umbrella"
 
 
 def win_data_dir(profile):
@@ -187,30 +227,50 @@ def _version_key(path):
 
 
 def windows_app(env=None):
-    """The Windows Claude.exe as a WSL path, or None."""
+    """The Windows Claude app as a Windows path (str), or None.
+
+    Looks for, in order: UMBRELLA_DESKTOP_APP, the classic installer (%LOCALAPPDATA%\\AnthropicClaude),
+    and the Microsoft Store app's 'claude-desktop.exe' alias.
+    """
     override = app_override(env)
     if override:
-        return Path(override) if Path(override).is_file() else None
+        if PureWindowsPath(override).drive:
+            return override
+        return to_windows(override) if Path(override).is_file() else None
     local = windows_env("LOCALAPPDATA")
     local_wsl = to_wsl(local) if local else None
     if not local_wsl:
         return None
-    base = Path(local_wsl)
+    base, win_base = Path(local_wsl), PureWindowsPath(local)
     squirrel = base / "AnthropicClaude"
-    # Prefer the newest versioned folder; fall back to Squirrel's stub, then other install layouts.
-    candidates = [v / "claude.exe" for v in sorted(squirrel.glob("app-*"), key=_version_key, reverse=True)]
-    candidates += [squirrel / "claude.exe", base / "Programs" / "Claude" / "Claude.exe",
-                   base / "Microsoft" / "WindowsApps" / "Claude.exe"]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+    found = [v / "claude.exe" for v in sorted(squirrel.glob("app-*"), key=_version_key, reverse=True)]
+    found += [squirrel / "claude.exe", base / "Programs" / "Claude" / "Claude.exe"]
+    aliases = base / "Microsoft" / "WindowsApps"
+    # Store aliases are special files WSL can list but not always stat, so check with lexists.
+    found += sorted(aliases.glob("Claude_*/" + STORE_ALIAS)) + [aliases / STORE_ALIAS]
+    for candidate in found:
+        if os.path.lexists(str(candidate)):
+            return str(win_base.joinpath(*candidate.relative_to(base).parts))
+    family = powershell("(Get-AppxPackage -Name Claude | Select-Object -First 1).PackageFamilyName")
+    if family:
+        return str(win_base / "Microsoft" / "WindowsApps" / family / STORE_ALIAS)
     return None
 
 
-def windows_command(profile, exe):
-    if profile.uses_default_dir:
-        return [str(exe)]
-    return [str(exe), "--user-data-dir={}".format(win_data_dir(profile))]
+def windows_args(profile):
+    return [] if profile.uses_default_dir else ["--user-data-dir={}".format(win_data_dir(profile))]
+
+
+def windows_command(profile, app):
+    """Start the app via PowerShell's Start-Process, which also handles Store app aliases."""
+    shell = windows_tool("powershell.exe")
+    if shell is None:
+        raise _interop_error("looking for powershell.exe")
+    script = "Start-Process -FilePath {}".format(_ps_quote(app))
+    args = windows_args(profile)
+    if args:
+        script += " -ArgumentList {}".format(_ps_quote(" ".join('"{}"'.format(a) for a in args)))
+    return [shell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script]
 
 
 def windows_environment(profile, base=None):
@@ -232,21 +292,32 @@ def _vbs_quote(value):
     return '"' + value.replace('"', '""') + '"'
 
 
-def write_windows_launcher(profile, exe):
+def _ps_quote(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _start_menu_link(profile):
+    appdata = _require_windows_env("APPDATA")
+    return PureWindowsPath(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / \
+        "Claude ({}).lnk".format(profile.name)
+
+
+def _launcher_script(profile):
+    return win_umbrella_root() / "launchers" / "claude-{}.vbs".format(profile.name)
+
+
+def write_windows_launcher(profile, app):
     """A Start Menu shortcut "Claude (<name>)" that opens this profile without a console window.
 
     Windows shortcuts can't set environment variables, so the shortcut runs a tiny VBScript
     that sets CLAUDE_CONFIG_DIR and starts Claude.
     """
-    win_exe = to_windows(exe)
-    if win_exe is None:
-        raise UmbrellaError("Couldn't convert {} to a Windows path.".format(exe))
-    appdata = _require_windows_env("APPDATA")
-    script_win = win_umbrella_root() / "launchers" / "claude-{}.vbs".format(profile.name)
-    script_local = to_wsl(str(script_win))
+    link = _start_menu_link(profile)
+    script_win = _launcher_script(profile)
+    script_local = to_wsl(script_win)
     if script_local is None:
-        raise UmbrellaError("Couldn't reach Umbrella's Windows folder ({}) from WSL.".format(script_win))
-    command_line = " ".join('"{}"'.format(part) for part in [win_exe] + windows_command(profile, win_exe)[1:])
+        raise UmbrellaError("Couldn't reach Umbrella's Windows folder ({}) from WSL.".format(script_win.parent))
+    command_line = " ".join('"{}"'.format(part) for part in [app] + windows_args(profile))
     lines = ['Set shell = CreateObject("WScript.Shell")',
              'Set env = shell.Environment("PROCESS")',
              'env("UMBRELLA_PROFILE") = {}'.format(_vbs_quote(profile.name))]
@@ -257,21 +328,15 @@ def write_windows_launcher(profile, exe):
     Path(script_local).write_text("' Made by Umbrella: opens Claude as profile '{}'.\r\n".format(profile.name)
                                   + "\r\n".join(lines) + "\r\n")
 
-    link = PureWindowsPath(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / \
-        "Claude ({}).lnk".format(profile.name)
     ps = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut({link}); "
           "$s.TargetPath = 'wscript.exe'; $s.Arguments = {args}; $s.IconLocation = {icon}; "
-          "$s.Description = {desc}; $s.Save()").format(
+          "$s.Description = {desc}; $s.Save(); 'ok'").format(
         link=_ps_quote(str(link)), args=_ps_quote('"{}"'.format(script_win)),
-        icon=_ps_quote(win_exe + ",0"), desc=_ps_quote("Claude as Umbrella profile '{}'".format(profile.name)))
-    if _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps + "; 'ok'"]) is None:
+        icon=_ps_quote(app + ",0"), desc=_ps_quote("Claude as Umbrella profile '{}'".format(profile.name)))
+    if powershell(ps) is None:
         raise UmbrellaError("Windows didn't let Umbrella create the Start Menu shortcut.",
                             hint="You can still open the profile with 'umbrella desktop {}'.".format(profile.name))
     return link
-
-
-def _ps_quote(value):
-    return "'" + value.replace("'", "''") + "'"
 
 
 # ----- both -------------------------------------------------------------------------------------
@@ -288,9 +353,22 @@ class Launch:
 
 
 def _not_found(platform):
-    where = "/Applications" if platform == "macos" else "Windows"
-    return UmbrellaError("Couldn't find the Claude Desktop app in {}.".format(where),
-                         hint="Install it from https://claude.ai/download, or set UMBRELLA_DESKTOP_APP to its path.")
+    if platform == "macos":
+        return UmbrellaError("Couldn't find Claude.app in /Applications or ~/Applications.",
+                             hint="Install it from https://claude.ai/download, or set UMBRELLA_DESKTOP_APP "
+                                  "to the path of Claude.app.")
+    return UmbrellaError(
+        "Couldn't find the Claude Desktop app on Windows.",
+        hint="Checked %LOCALAPPDATA%\\AnthropicClaude and the Microsoft Store app (claude-desktop.exe). "
+             "Install it from https://claude.ai/download, or set UMBRELLA_DESKTOP_APP to its Windows path.")
+
+
+def _require_windows_app(env):
+    _require_windows_env("LOCALAPPDATA")  # a clear error if WSL can't reach Windows at all
+    app = windows_app(env)
+    if app is None:
+        raise _not_found("wsl")
+    return app
 
 
 def plan_launch(profile, platform=None, env=None):
@@ -306,16 +384,14 @@ def plan_launch(profile, platform=None, env=None):
             os.chmod(str(data), 0o700)
         return Launch(platform, mac_command(profile, app), mac_environment(profile, env), data, first)
     if platform == "wsl":
-        exe = windows_app(env)
-        if exe is None:
-            raise _not_found(platform)
+        app = _require_windows_app(env)
         data = None
         first = False
         if not profile.uses_default_dir:
             data = win_data_dir(profile)
-            data_wsl = to_wsl(str(data))
+            data_wsl = to_wsl(data)
             first = bool(data_wsl) and not Path(data_wsl).exists()
-        return Launch(platform, windows_command(profile, exe), windows_environment(profile, env), data, first)
+        return Launch(platform, windows_command(profile, app), windows_environment(profile, env), data, first)
     raise UmbrellaError("The Claude Desktop app runs on macOS and Windows, not on {}.".format(paths.platform_name(platform)),
                         hint="On Windows, run Umbrella inside WSL2 and it will open the Windows app for you.")
 
@@ -335,10 +411,7 @@ def create_shortcut(profile, platform=None, env=None):
             raise _not_found(platform)
         return write_mac_launcher(profile, app)
     if platform == "wsl":
-        exe = windows_app(env)
-        if exe is None:
-            raise _not_found(platform)
-        return write_windows_launcher(profile, exe)
+        return write_windows_launcher(profile, _require_windows_app(env))
     raise UmbrellaError("Desktop shortcuts are only available on macOS and Windows (WSL2).")
 
 
@@ -353,15 +426,12 @@ def remove_artifacts(profile, platform=None):
             if target.exists():
                 shutil.rmtree(str(target))
                 removed.append(paths.pretty(target))
-    elif platform == "wsl" and windows_env("LOCALAPPDATA"):
-        appdata = windows_env("APPDATA")
-        targets = [win_data_dir(profile), win_config_dir(profile),
-                   win_umbrella_root() / "launchers" / "claude-{}.vbs".format(profile.name)]
-        if appdata:
-            targets.append(PureWindowsPath(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" /
-                           "Claude ({}).lnk".format(profile.name))
+    elif platform == "wsl" and windows_env("USERPROFILE"):
+        targets = [win_data_dir(profile), win_config_dir(profile), _launcher_script(profile)]
+        if windows_env("APPDATA"):
+            targets.append(_start_menu_link(profile))
         for target in targets:
-            local = to_wsl(str(target))
+            local = to_wsl(target)
             if local and os.path.lexists(local):
                 shutil.rmtree(local) if os.path.isdir(local) else os.remove(local)
                 removed.append(str(target))

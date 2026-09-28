@@ -165,6 +165,14 @@ class ProfileCommandsTest(CliTest):
         code, out, _ = self.run_cli("current", env={"CLAUDE_CONFIG_DIR": str(work.config_dir)})
         self.assertIn("not signed in", out)
 
+    def test_login_without_claude_on_wsl(self):
+        self.setup_two_profiles()
+        with mock.patch.object(paths, "detect_platform", return_value="wsl"):
+            code, out, err = self.run_cli("login", "work")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")  # no "Opening Claude Code..." before the error
+        self.assertIn("isn't installed inside WSL", err)
+
     def test_login_and_run(self):
         work = self.setup_two_profiles()
         record = self.tmp / "record"

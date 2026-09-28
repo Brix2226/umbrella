@@ -43,15 +43,26 @@ def profile_environment(profile, base=None):
     return env
 
 
+def require_claude(env=None, platform=None):
+    """Path to `claude`, or a friendly error explaining how to install it here."""
+    claude = find_claude(env)
+    if claude is not None:
+        return claude
+    if (platform or paths.detect_platform()) == "wsl":
+        raise UmbrellaError(
+            "Claude Code isn't installed inside WSL.",
+            hint="Umbrella's terminal commands need Claude Code in WSL itself (a Windows install can't be "
+                 "used from here). Install it with: curl -fsSL https://claude.ai/install.sh | bash")
+    raise UmbrellaError(
+        "Couldn't find the 'claude' command.",
+        hint="Install Claude Code with: curl -fsSL https://claude.ai/install.sh | bash "
+             "(or see https://docs.claude.com/claude-code), then make sure 'claude' is on your PATH.")
+
+
 def run_claude(profile, args, env=None):
     """Run Claude Code as ``profile`` and return its exit code."""
     base = os.environ if env is None else env
-    claude = find_claude(base)
-    if claude is None:
-        raise UmbrellaError(
-            "Couldn't find the 'claude' command.",
-            hint="Install Claude Code (https://docs.claude.com/claude-code) and make sure 'claude' is on your PATH.",
-        )
+    claude = require_claude(base)
     return subprocess.call([claude] + list(args), env=profile_environment(profile, base))
 
 

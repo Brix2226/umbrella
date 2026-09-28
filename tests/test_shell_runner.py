@@ -100,6 +100,14 @@ class RunnerTest(FakeHomeTest):
         runner.run_claude(profiles.Profile("personal"), [], {"PATH": str(self.bin), "CLAUDE_CONFIG_DIR": "/old"})
         self.assertEqual(record.read_text(), "|personal|\n")
 
+    def test_require_claude_explains_wsl(self):
+        with self.assertRaises(UmbrellaError) as cm:
+            runner.require_claude({}, "wsl")
+        self.assertIn("inside WSL", str(cm.exception))
+        self.assertIn("claude.ai/install.sh", cm.exception.hint)
+        stub = self.stub("claude", "true")
+        self.assertEqual(runner.require_claude({"PATH": str(self.bin)}, "wsl"), str(stub))
+
     def test_run_claude_missing(self):
         with self.assertRaises(UmbrellaError) as cm:
             runner.run_claude(profiles.Profile("p"), [])

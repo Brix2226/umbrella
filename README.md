@@ -29,6 +29,10 @@ Remove it with `./install.sh --uninstall` (your profiles in `~/.umbrella` are ke
 
 ## Quick start
 
+The terminal commands (`login`, `run`, `use`) need Claude Code installed where Umbrella runs. On
+Windows that means inside WSL: `curl -fsSL https://claude.ai/install.sh | bash`. The Desktop app
+commands don't need it.
+
 ```sh
 umbrella init            # registers your current Claude setup as "personal" and offers to add the shell hook
 umbrella add work        # creates a second, empty profile
@@ -82,16 +86,19 @@ your normal Desktop app, unchanged.
 - **macOS:** the launcher is `~/Applications/Claude (work).app`. Find it with Spotlight or
   Launchpad, or drag it to the Dock. The Desktop profile's app data lives in
   `~/.umbrella/desktop/<name>`. Its Code tab shares history with the same profile in the terminal.
-- **Windows:** run Umbrella in WSL2. It finds the Windows Desktop app and starts it through WSL's
-  Windows interop. The launcher is a Start Menu shortcut named "Claude (work)". Profile data lives
-  on the Windows side in `%LOCALAPPDATA%\Umbrella` (`desktop\<name>` for the app, `claude\<name>`
-  for its Code tab). The Windows app's Code tab runs as a Windows program, so its history is
-  separate from the same profile's CLI history in WSL.
+- **Windows:** run Umbrella in WSL2. It finds the Windows Desktop app, either the Microsoft Store
+  version (through its `claude-desktop.exe` alias) or the classic installer, and starts it through
+  WSL's Windows interop. It works even if your WSL setup doesn't put Windows folders on PATH. The
+  launcher is a Start Menu shortcut named "Claude (work)". Profile data lives on the Windows side in
+  `%USERPROFILE%\.umbrella` (`desktop\<name>` for the app, `claude\<name>` for its Code tab). It's
+  kept out of `AppData` on purpose, because Windows redirects what Store apps write there. The
+  Windows app's Code tab runs as a Windows program, so its history is separate from the same
+  profile's CLI history in WSL.
 - **First sign-in:** open the new profile and sign in with that account. If signing in sends you to
   your browser and back to the app, quit your other Claude windows first, so the sign-in comes back
   to the new one.
 - If the app is installed somewhere unusual, point `UMBRELLA_DESKTOP_APP` at `Claude.app` (macOS)
-  or `claude.exe` (Windows, as a WSL path).
+  or at the Windows app's `.exe` (as a Windows path such as `C:\...\claude.exe`, or a WSL path).
 
 `umbrella remove <name>` also deletes that profile's Desktop app data and launcher.
 
