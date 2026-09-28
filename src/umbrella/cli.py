@@ -6,7 +6,7 @@ import os
 import shutil
 import sys
 
-from umbrella import __version__, backup, inspector, paths, profiles, prompt, runner, shell
+from umbrella import __version__, backup, desktop, inspector, paths, profiles, prompt, runner, shell
 from umbrella.errors import UmbrellaError
 from umbrella.fmt import human_size, plural
 from umbrella.render import Style, render_profiles, render_report
@@ -270,6 +270,39 @@ def cmd_shell_init(ctx, args):
     return 0
 
 
+def cmd_desktop(ctx, args):
+    reg = _registry()
+    reg.require_initialized()
+    profile = reg.get(args.name) if args.name else (reg.current(ctx.env) or (reg.default and reg.get(reg.default)))
+    if not profile:
+        raise UmbrellaError("Which profile should Claude Desktop open?", hint="Example: umbrella desktop work")
+    s = ctx.style
+    platform = paths.detect_platform()
+    if args.shortcut:
+        where = desktop.create_shortcut(profile, platform, ctx.env)
+        if platform == "macos":
+            ctx.say(s.ok("Created 'Claude ({})' in {}".format(profile.name, paths.pretty(where.parent))))
+            ctx.say("  Open it from Spotlight or Launchpad, or drag it to your Dock.")
+        else:
+            ctx.say(s.ok("Added 'Claude ({})' to the Windows Start Menu.".format(profile.name)))
+        return 0
+    launch = desktop.plan_launch(profile, platform, ctx.env)
+    desktop.start(launch)
+    if profile.uses_default_dir:
+        ctx.say(s.ok("Opening your normal Claude app (profile '{}').".format(profile.name)))
+        return 0
+    ctx.say(s.ok("Opening Claude Desktop as profile '{}'.".format(profile.name)))
+    ctx.say(s.muted("  Its login and app data live in {}".format(
+        paths.pretty(launch.data_dir) if platform == "macos" else launch.data_dir)))
+    if platform == "wsl":
+        ctx.say(s.muted("  Its Code tab keeps its own history in {} (separate from the CLI in WSL).".format(
+            desktop.win_config_dir(profile))))
+    if launch.first_run:
+        ctx.say(s.wrap(desktop.FIRST_RUN_TIP.format(name=profile.name), "  "))
+        ctx.say("  Tip: 'umbrella desktop {} --shortcut' makes a launcher you can click.".format(profile.name))
+    return 0
+
+
 def cmd_remove(ctx, args):
     reg = _registry()
     reg.require_initialized()
@@ -290,6 +323,8 @@ def cmd_remove(ctx, args):
     reg.save()
     if delete_files:
         shutil.rmtree(str(profile.config_dir))
+        for item in desktop.remove_artifacts(profile):
+            ctx.say(s.ok("Removed its Desktop app data: {}".format(item)))
         if runner.keychain_has_login(profile):
             runner.keychain_delete_login(profile)
             ctx.say(s.ok("Removed its saved login from the macOS Keychain."))
@@ -366,6 +401,12 @@ def cmd_doctor(ctx, args):
     checks.append(("ok", "Claude Code found at {}".format(paths.pretty(claude)), None) if claude else
                   ("fail", "Claude Code ('claude') isn't on your PATH",
                    "Install it from https://docs.claude.com/claude-code"))
+    if platform in ("macos", "wsl"):
+        try:
+            desktop.plan_launch(profiles.Profile("_"), platform, ctx.env)
+            checks.append(("ok", "Claude Desktop app found", None))
+        except UmbrellaError as exc:
+            checks.append(("warn", str(exc), exc.hint))
     checks.append(("ok", "'umbrella' is on your PATH", None) if shell.is_on_path("umbrella", ctx.env) else
                   ("warn", "'umbrella' isn't on your PATH", "Run ./install.sh, or add ~/.local/bin to PATH."))
     sh = shell.detect_shell(ctx.env)
@@ -447,6 +488,11 @@ def build_parser():
     p = add("use", cmd_use, "Switch this shell to a profile (needs the shell hook).")
     p.add_argument("name")
     p.add_argument("--default", action="store_true", help="also make it the profile new shells start with")
+
+    p = add("desktop", cmd_desktop, "Open the Claude Desktop app as a profile (macOS, or Windows from WSL2).")
+    p.add_argument("name", nargs="?", help="profile to open (default: this shell's, else your default)")
+    p.add_argument("--shortcut", action="store_true",
+                   help="create a clickable 'Claude (<name>)' launcher instead of opening it now")
 
     add("off", cmd_off, "Stop using a profile in this shell (needs the shell hook).")
 

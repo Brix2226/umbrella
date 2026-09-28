@@ -5,6 +5,8 @@ Switch between Claude Code accounts, and see exactly what Claude keeps on your c
 - **Two (or more) accounts, no juggling.** Each profile is its own Claude Code config directory,
   with its own login, history, settings and plugins. Switch a terminal with `umbrella use work`, or
   run both accounts side by side in different terminals.
+- **Works with the Claude Desktop app too.** `umbrella desktop work` opens a separate copy of the
+  Desktop app signed in as that account, next to your normal one. On macOS and on Windows (from WSL2).
 - **Never touches your tokens.** Umbrella doesn't read, copy or store login credentials. Each profile
   signs in once through Claude's own `/login`; Umbrella just points `CLAUDE_CONFIG_DIR` at the right place.
 - **A plain-language tour of `~/.claude`.** `umbrella inspect` explains every file and folder:
@@ -62,6 +64,37 @@ umbrella run work                 # interactive Claude as "work"
 umbrella run work -- -p "hello"   # anything after -- goes to claude
 ```
 
+## The Claude Desktop app
+
+The Desktop app keeps its own claude.ai login, so it isn't affected by `umbrella use`. Instead, open
+it as a profile:
+
+```sh
+umbrella desktop work              # open Claude Desktop as "work" (runs alongside your normal Claude)
+umbrella desktop work --shortcut   # make a clickable "Claude (work)" launcher
+umbrella desktop personal          # your normal app, as usual
+```
+
+Each Desktop profile gets its own login, settings and app data, and its **Code** tab keeps its
+sessions and history in that profile's Claude folder. Your default profile ("personal") is simply
+your normal Desktop app, unchanged.
+
+- **macOS:** the launcher is `~/Applications/Claude (work).app`. Find it with Spotlight or
+  Launchpad, or drag it to the Dock. The Desktop profile's app data lives in
+  `~/.umbrella/desktop/<name>`. Its Code tab shares history with the same profile in the terminal.
+- **Windows:** run Umbrella in WSL2. It finds the Windows Desktop app and starts it through WSL's
+  Windows interop. The launcher is a Start Menu shortcut named "Claude (work)". Profile data lives
+  on the Windows side in `%LOCALAPPDATA%\Umbrella` (`desktop\<name>` for the app, `claude\<name>`
+  for its Code tab). The Windows app's Code tab runs as a Windows program, so its history is
+  separate from the same profile's CLI history in WSL.
+- **First sign-in:** open the new profile and sign in with that account. If signing in sends you to
+  your browser and back to the app, quit your other Claude windows first, so the sign-in comes back
+  to the new one.
+- If the app is installed somewhere unusual, point `UMBRELLA_DESKTOP_APP` at `Claude.app` (macOS)
+  or `claude.exe` (Windows, as a WSL path).
+
+`umbrella remove <name>` also deletes that profile's Desktop app data and launcher.
+
 ## Commands
 
 | Command | What it does |
@@ -72,12 +105,13 @@ umbrella run work -- -p "hello"   # anything after -- goes to claude
 | `umbrella list [--json]` | Profiles, their accounts, where their data lives and how big it is. `▸` marks this shell's profile. |
 | `umbrella use <name> [--default]` / `umbrella off` | Switch this shell (needs the hook). |
 | `umbrella run <name> [-- args]` | Run Claude once as a profile. |
+| `umbrella desktop [name] [--shortcut]` | Open the Claude Desktop app as a profile, or create a clickable launcher for it. |
 | `umbrella current` | Which profile and account this shell is on. |
 | `umbrella inspect [--profile X] [--all] [--json]` | Explain everything Claude stores for a profile. |
 | `umbrella backup [--profile X] [-o FILE] [--include-secrets]` | Save a profile to a private `.tar.gz`. |
 | `umbrella restore FILE [--profile X] [--yes]` | Restore a backup, after showing what's in it and saving your current state. |
 | `umbrella remove <name> [--yes] [--keep-files] [--no-backup]` | Delete a profile. It's backed up first unless you say otherwise. Your original `~/.claude` is never deleted. |
-| `umbrella doctor` | Check Python, Claude, the shell hook, and each profile's sign-in and permissions. |
+| `umbrella doctor` | Check Python, Claude, the Desktop app, the shell hook, and each profile's sign-in and permissions. |
 
 ## What `inspect` shows
 
@@ -114,6 +148,9 @@ Umbrella keeps a small registry at `~/.umbrella/profiles.json` (mode 600). New p
 `~/.umbrella/profiles/<name>` (mode 700), and backups in `~/.umbrella/backups`. Set `UMBRELLA_DIR`
 to keep all of that somewhere else.
 
+For the Desktop app, Umbrella starts the app with `--user-data-dir=<profile folder>`, which gives it
+separate login storage, and with `CLAUDE_CONFIG_DIR` set for its Code tab.
+
 **On WSL2:** run Claude Code and Umbrella inside the Linux distribution. Profiles live in the Linux
 home directory, not on the Windows drive.
 
@@ -136,5 +173,7 @@ make coverage   # run it under coverage.py (installed into .venv); fails below 1
 ```
 
 The tests build a fake home directory for every test, so they never touch your real `~/.claude`.
-The `claude` and `security` commands are replaced with stub scripts on a temporary `PATH`.
+The `claude`, `security`, `osacompile`, `codesign`, `cmd.exe`, `wslpath` and `powershell.exe`
+commands are replaced with stub scripts on a temporary `PATH`, so the Windows code paths are tested
+on any OS.
 The only development dependency is `coverage`.

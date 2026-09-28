@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,6 +61,13 @@ class FakeHomeTest(unittest.TestCase):
         path = self.bin / name
         path.write_text("#!/bin/sh\n" + script + "\n")
         path.chmod(path.stat().st_mode | stat.S_IEXEC)
+        return path
+
+    def pystub(self, name, code):
+        """A stub command written in Python (so it doesn't depend on the test PATH)."""
+        path = self.bin / name
+        path.write_text("#!{}\n{}\n".format(sys.executable, code))
+        path.chmod(0o755)
         return path
 
     def claude_tree(self, root=None):
