@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umbrella-claude"
+version = "0.1.0"
+description = "Switch between Claude Code accounts and see what Claude stores on your computer."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+umbrella = "umbrella.cli:main_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]

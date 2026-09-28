@@ -1,0 +1,27 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.8", "3.10", "3.12", "3.13"]
+        exclude:
+          - { os: macos-latest, python: "3.8" }  # no arm64 build of 3.8
+        include:
+          - { os: macos-latest, python: "3.9" }  # what macOS ships as /usr/bin/python3
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: make coverage PYTHON=python
+      - name: install.sh smoke test
+        run: |
+          UMBRELLA_BIN_DIR="$RUNNER_TEMP/bin" UMBRELLA_LIB_DIR="$RUNNER_TEMP/lib" ./install.sh
+          "$RUNNER_TEMP/bin/umbrella" --version
+          HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/bin/umbrella" inspect
